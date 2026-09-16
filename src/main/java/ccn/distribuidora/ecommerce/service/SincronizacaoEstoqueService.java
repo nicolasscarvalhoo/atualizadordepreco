@@ -1,7 +1,7 @@
 package ccn.distribuidora.ecommerce.service;
 
-import ccn.distribuidora.ecommerce.domain.entity.Produto;
-import ccn.distribuidora.ecommerce.domain.entity.VtexPriceDTO;
+import ccn.distribuidora.ecommerce.domain.entity.EstoqueProduto;
+import ccn.distribuidora.ecommerce.domain.entity.VtexEstoqueDTO;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -17,24 +17,28 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
-public class SincronizacaoService {
+public class SincronizacaoEstoqueService {
 
-    private static final Logger logger = LoggerFactory.getLogger(SincronizacaoService.class);
+    private static final Logger logger = LoggerFactory.getLogger(SincronizacaoEstoqueService.class);
 
     private final RestClient restClient;
     private final JdbcTemplate jdbcTemplate;
 
-    private final String API_SITE = "https://api.vtex.com/ccndistribuidora/pricing";
+    // ID do seu Armazém na VTEX (Verifique no painel e altere se necessário)
+    private final String WAREHOUSE_ID = "1_1";
 
+    // URLs da VTEX
+    private final String API_LOGISTICS = "https://ccndistribuidora.vtexcommercestable.com.br/api/logistics/pvt/inventory/skus/";
     private final String API_CATALOG_REFID = "https://ccndistribuidora.vtexcommercestable.com.br/api/catalog_system/pvt/sku/stockkeepingunitidbyrefid/";
 
+    // Credenciais
     private final String VTEX_APP_KEY = "vtexappkey-ccndistribuidora-VNIRPT";
     private final String VTEX_APP_TOKEN = "PLUNCPDBYUXWCKAURVDWUREOOTVTBFYWSBIVIJGTSRTPYWJMCYSKUWJOAKCCVYGQPJVMVOESJDSEYXUARJPIXPEOGNZEFRKCAAZJKECRVEUTZZEAHSNCUEIXCAWWDZOB";
 
-    private final Map<Integer, Produto> memoriaPrecos = new ConcurrentHashMap<>();
+    private final Map<Integer, EstoqueProduto> memoriaEstoque = new ConcurrentHashMap<>();
     private boolean primeiraExecucao = true;
 
-    public SincronizacaoService(JdbcTemplate jdbcTemplate) {
+    public SincronizacaoEstoqueService(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = jdbcTemplate;
         this.restClient = criarRestClientIgnorandoSsl();
     }
@@ -60,41 +64,40 @@ public class SincronizacaoService {
                     .defaultHeader("User-Agent", "Mozilla/5.0")
                     .build();
         } catch (Exception e) {
-            logger.error("Erro ao configurar bypass de SSL: {}", e.getMessage());
             return RestClient.create();
         }
     }
 
+    // Roda a cada 1 minuto (pode colocar outro tempo se quiser descolar do atualizador de preços)
     @Scheduled(cron = "0 * * * * *")
-    public void executarSincronizacao() {
-        logger.info("Lendo VW_ECOMMERCE_PRECOS no banco de dados...");
+    public void executarSincronizacaoEstoque() {
+        logger.info("[ESTOQUE] Lendo VW_ECOMMERCE_ESTOQUE no banco de dados...");
 
         try {
-            String sql = "SELECT RefId, basePrice, costPrice FROM VW_ECOMMERCE_PRECOS";
-            List<Produto> produtosDoBanco = jdbcTemplate.query(sql, (rs, rowNum) -> new Produto(
+            String sql = "SELECT RefId, quantidade FROM VW_ECOMMERCE_ESTOQUE";
+            List<EstoqueProduto> produtosDoBanco = jdbcTemplate.query(sql, (rs, rowNum) -> new EstoqueProduto(
                     rs.getInt("RefId"),
-                    rs.getDouble("basePrice"),
-                    rs.getDouble("costPrice")
+                    rs.getInt("quantidade")
             ));
 
             if (primeiraExecucao) {
-                for (Produto p : produtosDoBanco) {
-                    memoriaPrecos.put(p.refId(), p);
+                for (EstoqueProduto p : produtosDoBanco) {
+                    memoriaEstoque.put(p.refId(), p);
                 }
                 primeiraExecucao = false;
-                logger.info("Memória inicial carregada com {} produtos.", produtosDoBanco.size());
+                logger.info("[ESTOQUE] Memória inicial carregada com {} produtos.", produtosDoBanco.size());
                 return;
             }
 
             int produtosAtualizados = 0;
 
-            for (Produto produtoAtual : produtosDoBanco) {
-                Produto produtoAntigo = memoriaPrecos.get(produtoAtual.refId());
+            for (EstoqueProduto produtoAtual : produtosDoBanco) {
+                EstoqueProduto produtoAntigo = memoriaEstoque.get(produtoAtual.refId());
 
                 if (produtoAntigo == null || !produtoAntigo.equals(produtoAtual)) {
 
                     try {
-                        // PASSO 1: Descobrir qual é o ID interno da VTEX usando o RefId
+                        // PASSO 1: Traduzir RefId para VTEX ID
                         String vtexSkuId = "";
                         try {
                             vtexSkuId = restClient.get()
@@ -105,30 +108,27 @@ public class SincronizacaoService {
                                     .retrieve()
                                     .body(String.class);
 
-                            // LIMPANDO A SUJEIRA DO JSON (Remove as aspas e espaços vazios)
                             if (vtexSkuId != null) {
                                 vtexSkuId = vtexSkuId.replace("\"", "").trim();
                             }
                         } catch (Exception e) {
-                            logger.warn("SKU com Código de Referência {} não encontrado na VTEX. Produto ignorado.", produtoAtual.refId());
-                            continue; // Pula para o próximo produto do laço
+                            continue; // Ignora se não existir na VTEX
                         }
 
-                        // PASSO 2: Se encontrou o ID limpo (ex: 2078), atualiza o preço usando ele
+                        // PASSO 2: Enviar saldo para o Armazém
                         if (vtexSkuId != null && !vtexSkuId.isEmpty()) {
 
-                            // Monta a URL final usando o ID interno limpo da VTEX
-                            String urlProduto = API_SITE + "/prices/" + vtexSkuId;
+                            // A URL de estoque exige o SkuId e o WarehouseId
+                            String urlEstoque = API_LOGISTICS + vtexSkuId + "/warehouses/" + WAREHOUSE_ID;
 
-                            VtexPriceDTO corpoVtex = new VtexPriceDTO(
-                                    produtoAtual.costPrice(),
-                                    produtoAtual.basePrice()
+                            // O DTO do estoque: Quantidade e se é infinito (false)
+                            VtexEstoqueDTO corpoVtex = new VtexEstoqueDTO(
+                                    produtoAtual.quantidade(),
+                                    false
                             );
 
-                            logger.info("Traduzido RefId {} para VTEX ID {}. Enviando preço...", produtoAtual.refId(), vtexSkuId);
-
                             restClient.put()
-                                    .uri(urlProduto)
+                                    .uri(urlEstoque)
                                     .header("X-VTEX-API-AppKey", VTEX_APP_KEY)
                                     .header("X-VTEX-API-AppToken", VTEX_APP_TOKEN)
                                     .header("Content-Type", "application/json")
@@ -137,22 +137,23 @@ public class SincronizacaoService {
                                     .retrieve()
                                     .toBodilessEntity();
 
-                            memoriaPrecos.put(produtoAtual.refId(), produtoAtual);
+                            memoriaEstoque.put(produtoAtual.refId(), produtoAtual);
                             produtosAtualizados++;
 
-                            logger.info("Sucesso! Preço do RefId {} atualizado na VTEX.", produtoAtual.refId());
+                            logger.info("[ESTOQUE] Sucesso! RefId {} (VTEX: {}) atualizado para {} un.",
+                                    produtoAtual.refId(), vtexSkuId, produtoAtual.quantidade());
                         }
 
                     } catch (Exception e) {
-                        logger.error("Falha ao enviar preço para RefId {}: {}", produtoAtual.refId(), e.getMessage());
+                        logger.error("[ESTOQUE] Falha ao enviar estoque para RefId {}: {}", produtoAtual.refId(), e.getMessage());
                     }
                 }
             }
 
-            logger.info("Ciclo finalizado. Total de atualizações enviadas: {}", produtosAtualizados);
+            logger.info("[ESTOQUE] Ciclo finalizado. Total de atualizações enviadas: {}", produtosAtualizados);
 
         } catch (Exception e) {
-            logger.error("Erro ao acessar o banco de dados: {}", e.getMessage());
+            logger.error("[ESTOQUE] Erro ao acessar o banco de dados: {}", e.getMessage());
         }
     }
 }
